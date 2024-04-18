@@ -14,4 +14,3 @@ This Tool depends on
 * [ctrlc](https://crates.io/crates/ctrlc)
 * [image](https://crates.io/crates/image)
 * [crossterm](https://crates.io/crates/crossterm)
-* [anyhow](https://crates.io/crates/anyhow) (loosely)
