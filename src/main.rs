@@ -1,14 +1,15 @@
 use std::cmp::Ordering;
 use std::io::{BufReader, Write};
+use std::str::FromStr;
 use std::time::Duration;
 
 use clap::Parser;
-use anyhow::Result;
+use clap::builder::{PossibleValuesParser, TypedValueParser};
 
 use crossterm::style::{Color, Colors, Print, ResetColor, SetColors};
 
 use image::codecs::gif::GifDecoder;
-use image::{AnimationDecoder, Delay, RgbaImage};
+use image::{AnimationDecoder, Delay, Frames, ImageDecoder, RgbaImage};
 
 const HALF_BLOCK: char = '▄';
 
@@ -17,9 +18,34 @@ const HALF_BLOCK: char = '▄';
 struct Args {
     #[arg(value_parser)]
     input: String,
+    
+    #[arg(long, value_parser(PossibleValuesParser::new(["nearest", "triangle", "catmullrom", "gaussian", "lanczos3"]).map(|s| FilterType::from_str(&s).unwrap())), default_value = "triangle", required = false)]
+    resize_mode: FilterType,
+
+    #[arg(long, default_value = "false", required = false)]
+    no_resize: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FilterType(image::imageops::FilterType);
+
+impl FromStr for FilterType {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(match s {
+            "nearest" => image::imageops::FilterType::Nearest,
+            "triangle" => image::imageops::FilterType::Triangle,
+            "catmullrom" => image::imageops::FilterType::CatmullRom,
+            "gaussian" => image::imageops::FilterType::Gaussian,
+            "lanczos3" => image::imageops::FilterType::Lanczos3,
+            _ => return Err("Invalid filter type")
+        }))
+    }
 }
 
 fn main() -> ! {
+    let mut stdout = std::io::stdout();
+
     ctrlc::set_handler(move || {
         crossterm::execute!(
             std::io::stdout(),
@@ -30,69 +56,33 @@ fn main() -> ! {
     }).expect("Error setting Ctrl-C handler");
     let args = Args::parse();
 
-    let file = match std::fs::File::open(args.input) {
-        Ok(file) => file,
-        Err(_) => {
-            eprintln!("File doesn't exist. Get mogged.");
-            std::process::exit(1);
-        }
+    let Ok(file) = std::fs::File::open(&args.input) else {
+        eprintln!("File doesn't exist.");
+        std::process::exit(1);
     };
 
-    let g_decoder
-        = GifDecoder::new(BufReader::new(file)).unwrap();
-    let mut raw_frames = vec![];
-    g_decoder.into_frames().map(|f| -> Result<(RgbaImage, Delay)> {
-        let f = f?;
-        let del = f.delay();
-        let buf: &RgbaImage = f.buffer();
-        Ok((buf.clone(), del))
-    })
-    .for_each(|f| {
-        raw_frames.push(f.unwrap());
-    });
+    if !args.input.ends_with(".gif") {
+        eprintln!("File is not a gif.");
+        std::process::exit(1);
+    }
 
+    let g_decoder = GifDecoder::new(BufReader::new(file)).unwrap();
     let (t_columns, t_rows) = crossterm::terminal::size().unwrap();
-    let (g_sx, g_sy) = raw_frames[0].0.dimensions();
+    // basically 2x the rows because of the half block
+    let (t_sx, t_sy): (u32, u32) = (t_columns.into(), (t_rows * 2).into());
+    let (g_sx, g_sy) = g_decoder.dimensions();
 
-    // calculate the dimensions of the largest image that fits (2 pixels per character in height)
-    let (sx, sy) = if g_sx > t_columns.into() || g_sy > t_rows.into() {
-        let scale = f64::min(t_columns as f64 / g_sx as f64, t_rows as f64 / g_sy as f64);
-        ((g_sx as f64 * scale) as u32, 2 * (g_sy as f64 * scale) as u32)
-    } else {
-        (g_sx, g_sy * 2)
-    };
-
-    let res_frames = raw_frames.iter().map(|(f, del)| {
-        let mut res_frame = RgbaImage::new(sx, sy);
-        for y in 0..sy {
-            for x in 0..sx {
-                let x0 = ((x as f64 / sx as f64) * g_sx as f64) as u32;
-                let y0 = ((y as f64 / sy as f64) * g_sy as f64) as u32;
-                let x1 = (((x + 1) as f64 / sx as f64) * g_sx as f64) as u32;
-                let y1 = (((y + 1) as f64 / sy as f64) * g_sy as f64) as u32;
-                let mut r = 0; let mut g = 0; let mut b = 0; let mut a = 0;
-                for y in y0..y1 {
-                    for x in x0..x1 {
-                        let pixel = f.get_pixel(x, y);
-                        let [r0, g0, b0, a0] = pixel.0;
-                        r += r0 as u32; g += g0 as u32; b += b0 as u32; a += a0 as u32;
-                    }
-                }
-                let n = (x1 - x0) * (y1 - y0);
-                let r = (r / n) as u8;
-                let g = (g / n) as u8;
-                let b = (b / n) as u8;
-                let a = (a / n) as u8;
-                res_frame.put_pixel(x, y, [r, g, b, a].into());
-            }
-        }
-        (res_frame, *del)
-    }).collect::<Vec<_>>();
-
-    drop(raw_frames);
+    let (sx, sy) = if (g_sx > t_sx || g_sy > t_sy) && !args.no_resize {
+        let scale = f64::min(t_sx as f64 / g_sx as f64, t_sy as f64 / g_sy as f64);
+        ((g_sx as f64 * scale) as u32, (g_sy as f64 * scale) as u32)
+    } else { (g_sx, g_sy) };
+    
+    
+    
+    let res_frames = resize_encode(g_decoder.into_frames(), (sx, sy), args.resize_mode);
 
     crossterm::execute!(
-        std::io::stdout(),
+        stdout,
         crossterm::cursor::Hide,
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
     ).unwrap();
@@ -118,18 +108,28 @@ fn main() -> ! {
                 }
                 if y != sy/2 - 1 {
                     crossterm::queue!(
-                        std::io::stdout(),
+                        stdout,
                         ResetColor,
                         Print("\n")
                     ).unwrap();
                 }   
             }
-            std::io::stdout().flush().unwrap();
+            stdout.flush().unwrap();
             std::thread::sleep(if Duration::from(*d).cmp(&start_time.elapsed()) == Ordering::Greater {Duration::from(*d) - start_time.elapsed()} else { Duration::from_secs(0) });
             crossterm::execute!(
-                std::io::stdout(),
+                stdout,
                 crossterm::cursor::MoveTo(0, 0),
             ).unwrap();
         });
     }
+}
+
+fn resize_encode(frames: Frames, to: (u32, u32), resize_mode: FilterType) -> Vec<(RgbaImage, Delay)> {
+    let (sx, sy) = to;
+    frames.map(|f| -> (RgbaImage, Delay) {
+        let f = f.unwrap();
+        let del = f.delay();
+        let f: &RgbaImage = f.buffer();
+        (image::imageops::resize(f, sx, sy, resize_mode.0), del)
+    }).collect::<Vec<_>>()
 }
